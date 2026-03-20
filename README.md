@@ -45,8 +45,8 @@ GND          → GND
 
 1. Clone this repository:
    ```bash
-   git clone <your-repo-url>
-   cd faux-lite
+   git clone https://github.com/GraphicHealer/Faux-Lite-Firmware.git
+   cd Faux-Lite-Firmware
    ```
 
 2. Build and upload:
@@ -199,7 +199,7 @@ The PDF is the authoritative reference for all available commands and their exac
 
 ## Home Assistant Integration
 
-Looking for Home Assistant integration? Check out the [Faux-Lite Display HACS Integration](https://github.com/GraphicHealer/fauxlite-hacs) for full Home Assistant support with service calls, entities, and automations.
+Looking for Home Assistant integration? Check out the [Faux-Lite Display HACS Integration](https://github.com/GraphicHealer/Faux-Lite-Addon) for full Home Assistant support with service calls, entities, and automations.
 
 ## Troubleshooting
 
