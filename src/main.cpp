@@ -7,6 +7,9 @@
 #include <Update.h>
 #include <ArduinoJson.h>
 #include <vector>
+#include <time.h>
+#include <FS.h>
+#include <LittleFS.h>
 
 // UART Configuration
 #define RX_PIN 21
@@ -22,19 +25,53 @@ String signID = "01";
 int baudRate = 9600;
 bool apOnlyMode = false;
 bool startBlank = false;
-bool runMessagesOnBoot = false;
 
-// Software-timed queue system for looping messages
+// Queue system: each queue is a list of message segments stored on the
+// ESP32 (LittleFS) and only written to a sign page when the queue runs.
+// Each <Fx> tag starts a new message on the page and the sign sequences
+// through them natively - no software timing required.
+// Queues run on page A; a chained "next queue" is written to page B.
+// Page Y is used for message tests, Z for system/boot messages.
+#define RUN_PAGE 'A'
+#define CHAIN_PAGE 'B'
+#define TEST_PAGE 'Y'
+
 struct QueueMessage
 {
-    String command; // Full Pro-Lite command (e.g., <CG><FQ>Hello World)
-    int duration;   // Duration in seconds to display this message
+    String command; // Message segment (e.g., <FB><CC><SJ>Hello World)
+    int duration;   // Pause in seconds after this message (~2s per <FP> tag)
 };
 
-std::vector<QueueMessage> messageQueue; // Unlimited messages
-bool queueActive = false;
-int currentQueueIndex = 0;
-unsigned long lastQueueTime = 0;
+struct MessageQueue
+{
+    String name;
+    int runTimes = 0;   // Times to loop this queue before switching (0 = loop forever)
+    int nextQueue = -1; // Queue index to switch to after runTimes (-1 = none)
+    std::vector<QueueMessage> messages;
+};
+
+struct QueueSchedule
+{
+    int queue = -1;      // Queue index to start
+    int hour = 0;        // 0-23
+    int minute = 0;      // 0-59
+    uint8_t days = 0;    // Bitmask: bit 0 = Sunday ... bit 6 = Saturday
+    bool enabled = true;
+};
+
+// Queues live in LittleFS so they aren't limited by sign page count or NVS
+// space - this cap just bounds JSON size and keeps the UI manageable.
+#define MAX_QUEUES 100
+#define MAX_SCHEDULES 50
+#define QUEUES_FILE "/queues.json"
+
+std::vector<MessageQueue> queues;
+std::vector<QueueSchedule> schedules;
+int activeQueue = -1; // Index of queue currently running on the sign (-1 = none)
+int bootQueue = -1;   // Queue index to run on boot (-1 = none)
+String timeZone = "UTC0"; // POSIX TZ string for NTP/scheduling
+bool timeSynced = false;
+int lastCheckedMinute = -1;
 
 // Web server
 AsyncWebServer server(80);
@@ -49,10 +86,15 @@ void blankDisplay();
 void restoreLastDisplay();
 String getChipID();
 void handleOTAUpload(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final);
-void startQueue();
+void startQueue(int index);
 void stopQueue();
-void saveQueueToPreferences();
-void loadQueueFromPreferences();
+void checkSchedules();
+String buildQueuePageCommand(int index, char page);
+String getLocalTimeString();
+void serializeQueuesTo(JsonDocument &doc);
+bool parseQueuesJson(JsonDocument &doc);
+void saveQueues();
+void loadQueues();
 
 void setup()
 {
@@ -65,10 +107,19 @@ void setup()
     baudRate = preferences.getInt("baudRate", 9600);
     apOnlyMode = preferences.getBool("apOnlyMode", false);
     startBlank = preferences.getBool("startBlank", false);
-    runMessagesOnBoot = preferences.getBool("runOnBoot", false);
+    timeZone = preferences.getString("timeZone", "UTC0");
+    preferences.end();
 
-    // Load queue from preferences
-    loadQueueFromPreferences();
+    // Mount LittleFS for queue/schedule storage (uses the spiffs partition)
+    if (!LittleFS.begin(true))
+    {
+        Serial.println("LittleFS mount failed - queues will not persist!");
+    }
+
+    // Load queues and schedules from storage
+    loadQueues();
+
+    preferences.begin("faux-lite", false);
 
     // Clear any corrupted lastDisplay command from previous firmware versions
     // This is a one-time cleanup - remove this after first boot if needed
@@ -124,10 +175,10 @@ void setup()
         Serial.println("Start Blank enabled - blanking display");
         blankDisplay();
     }
-    else if (runMessagesOnBoot && messageQueue.size() > 0)
+    else if (bootQueue >= 0 && bootQueue < (int)queues.size())
     {
-        Serial.println("Running message queue on boot");
-        startQueue();
+        Serial.printf("Running queue %d on boot\n", bootQueue);
+        startQueue(bootQueue);
     }
     else
     {
@@ -138,21 +189,8 @@ void setup()
 
 void loop()
 {
-    // Handle software-timed queue
-    if (queueActive && messageQueue.size() > 0)
-    {
-        unsigned long currentTime = millis();
-        unsigned long duration = messageQueue[currentQueueIndex].duration * 1000; // Convert seconds to milliseconds
-
-        if (currentTime - lastQueueTime >= duration)
-        {
-            // Move to next message
-            currentQueueIndex = (currentQueueIndex + 1) % messageQueue.size();
-            sendToProlite("<PA>" + messageQueue[currentQueueIndex].command);
-            lastQueueTime = currentTime;
-            Serial.printf("Queue: Displaying message %d/%d\n", currentQueueIndex + 1, messageQueue.size());
-        }
-    }
+    // Queued messages run natively on the sign - only schedules need checking
+    checkSchedules();
     delay(10);
 }
 
@@ -216,6 +254,10 @@ void setupWiFi()
 
     Serial.println("WiFi connected!");
     Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
+
+    // Start NTP sync for queue scheduling
+    configTzTime(timeZone.c_str(), "pool.ntp.org", "time.nist.gov");
+    Serial.printf("NTP time sync started (TZ: %s)\n", timeZone.c_str());
 
     // Show WiFi connected message
     String ssid = WiFi.SSID();
@@ -532,7 +574,7 @@ void setupWebServer()
             </form>
 
             <div class="settings-link">
-                <a href="/messages">Message List</a> |
+                <a href="/messages">Queues</a> |
                 <a href="/settings">Settings & OTA Update</a>
             </div>
         </div>
@@ -596,6 +638,11 @@ void setupWebServer()
 
 &lt;ID01&gt;&lt;PA&gt;&lt;CA&gt;RED &lt;CG&gt;YELLOW &lt;CM&gt;GREEN
   └─ Multi-color message</pre>
+
+                <h3>Multiple Messages on One Page</h3>
+                <pre>&lt;PA&gt;&lt;FB&gt;&lt;CC&gt;&lt;SJ&gt;Hello World&lt;FP&gt;&lt;FB&gt;&lt;CL&gt;Second Message:&lt;FP&gt;&lt;FP&gt;&lt;FS&gt;&lt;CC&gt;Scrolling Text&lt;FP&gt;
+  └─ Each &lt;F?&gt; tag begins a new message on the page
+  └─ &lt;FP&gt; holds the preceding text for ~2 seconds</pre>
 
                 <h3>Special Commands</h3>
                 <pre>&lt;ST&gt;  Set time (sync with system)
@@ -703,7 +750,7 @@ void setupWebServer()
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Faux-Lite Message List</title>
+    <title>Faux-Lite Queues</title>
     <style>
         body {
             font-family: Arial, Helvetica, sans-serif;
@@ -750,6 +797,13 @@ void setupWebServer()
             display: block;
             margin-bottom: 3px;
             font-weight: bold;
+        }
+        input, select {
+            padding: 5px;
+            border: 2px solid #000000;
+            background: #FFFFFF;
+            font-family: Arial, sans-serif;
+            font-size: 14px;
         }
         textarea {
             width: 100%;
@@ -825,41 +879,89 @@ void setupWebServer()
 </head>
 <body>
     <div class="navbar">
-        <h1>Faux-Lite Message List</h1>
+        <h1>Faux-Lite Queues</h1>
     </div>
 
     <div class="container">
         <div class="panel">
-            <h2>Message Queue Configuration</h2>
+            <h2>Queues</h2>
             <div class="info">
-                <strong>Software-Timed Queue System:</strong> Messages loop continuously with configurable duration.<br>
-                Add unlimited messages to the queue - each will display for the specified duration.<br>
-                <strong>Duration:</strong> Time in seconds to display each message before switching to the next.
+                <strong>Queues are stored on this device</strong> (up to 100) and written to the
+                sign only when run - the running queue always uses <strong>page A</strong>
+                (a chained next-queue uses <strong>page B</strong>).<br>
+                Messages in a queue are compiled into that single page - each
+                <code>&lt;F?&gt;</code> tag starts a new message and the sign loops them natively.<br>
+                <strong>Pause After:</strong> seconds to hold each message - converted to
+                <code>&lt;FP&gt;</code> tags (~2 seconds each, rounded). Use 0 for no pause.<br>
+                Do not include <code>&lt;Px&gt;</code> page tags - they are stripped automatically.
             </div>
-            <form id="messageForm">
+            <form id="queueForm">
+                <div class="form-group">
+                    <label>Queue</label>
+                    <div style="display: flex; gap: 5px;">
+                        <select id="queueSelect" onchange="selectQueue(this.value)" style="flex: 1; margin-top: 0;"></select>
+                        <button type="button" onclick="addQueue()" style="width: auto; margin-top: 0;">+ New</button>
+                        <button type="button" class="danger" onclick="removeQueue()" style="width: auto; margin-top: 0;">Delete</button>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>Name</label>
+                    <input type="text" id="queueName" onchange="updateQueueName(this.value)">
+                </div>
+                <div class="form-group">
+                    <label>Sign Page</label>
+                    <input type="text" readonly value="Page A when running (page B for chained next-queue)">
+                </div>
                 <div id="queueContainer"></div>
                 <button type="button" onclick="addMessage()" style="margin-bottom: 10px;">+ Add Message</button>
                 <div class="form-group">
-                    <label>
-                        <input type="checkbox" id="runOnBoot" name="runOnBoot" style="width: auto;">
-                        Run message queue on boot
-                    </label>
+                    <label>When this queue finishes</label>
+                    <select id="finishMode" onchange="updateFinishMode()">
+                        <option value="loop">Loop forever</option>
+                        <option value="next">Run a set number of times, then switch queues</option>
+                    </select>
                 </div>
-                <button type="submit">Save Queue</button>
+                <div class="form-group" id="finishOptions" style="display: none;">
+                    Run <input type="number" id="runTimes" min="1" max="99" style="width: 80px; display: inline-block;" onchange="updateRunTimes(this.value)">
+                    times, then switch to
+                    <select id="nextQueue" style="width: auto; display: inline-block;" onchange="updateNextQueue(this.value)"></select>
+                    <br><small>The queue it switches to then loops forever (only one hop is supported).</small>
+                </div>
+                <div class="form-group">
+                    <label>Run on boot</label>
+                    <select id="bootQueue" onchange="bootQueue = parseInt(this.value)"></select>
+                </div>
+                <button type="submit">Save All</button>
                 <div id="saveStatus" class="status"></div>
             </form>
         </div>
 
         <div class="panel">
+            <h2>Schedules</h2>
+            <div class="info">
+                Sign time: <strong id="signTime">Loading...</strong><br>
+                <small>Schedules start a queue at the set time on the selected days.
+                Timezone is configured in <a href="/settings" style="color:#0000FF;">Settings</a>.
+                Requires internet (NTP) - schedules cannot fire in AP-Only mode.</small>
+            </div>
+            <div id="scheduleContainer"></div>
+            <button type="button" onclick="addSchedule()">+ Add Schedule</button>
+        </div>
+
+        <div class="panel">
             <h2>Queue Control</h2>
             <div class="info">
-                Current Status: <strong id="loopStatus">Loading...</strong><br>
-                Messages in queue: <strong id="messageCount">0</strong><br>
-                <small>Queue uses software timing for infinite looping</small>
+                Active queue: <strong id="activeQueueLabel">Loading...</strong><br>
+                <small>Starting writes the selected queue's messages to its page as one
+                command - the sign loops them natively. Stopping blanks the display.</small>
             </div>
             <div class="loop-controls">
-                <button onclick="startQueue()">Start Queue</button>
+                <button onclick="startSelected()">Start Selected Queue</button>
                 <button onclick="stopQueue()" class="danger">Stop Queue</button>
+            </div>
+            <div class="form-group" style="margin-top: 15px;">
+                <label>Compiled Page Command (selected queue):</label>
+                <textarea id="compiledPreview" readonly style="min-height: 0; height: 70px; font-size: 11px;"></textarea>
             </div>
             <div id="loopControlStatus" class="status"></div>
         </div>
@@ -870,24 +972,86 @@ void setupWebServer()
     </div>
 
     <script>
-        let queueMessages = [];
+        let queues = [];
+        let schedules = [];
+        let bootQueue = -1;
+        let currentQueue = 0;
+        let maxQueues = 100;
+        const RUN_PAGE = 'A';   // page the running queue is written to
+        const CHAIN_PAGE = 'B'; // page the chained next-queue is written to
+        const TEST_PAGE = 'Y';  // scratch page for message tests
+        const DAY_LABELS = ['S', 'M', 'T', 'W', 'T', 'F', 'S'];
 
         // Load current settings
         fetch('/api/messages')
             .then(r => r.json())
             .then(data => {
-                queueMessages = data.messages || [];
-                document.getElementById('runOnBoot').checked = data.runOnBoot;
-                document.getElementById('messageCount').textContent = data.queueSize || 0;
-                document.getElementById('loopStatus').textContent = data.queueActive ? 'Running' : 'Stopped';
-                renderQueue();
+                queues = data.queues || [];
+                schedules = data.schedules || [];
+                bootQueue = (data.bootQueue === undefined) ? -1 : data.bootQueue;
+                maxQueues = data.maxQueues || 25;
+                if (queues.length === 0) {
+                    queues.push({ name: 'Queue 1', runTimes: 0, nextQueue: -1, messages: [] });
+                }
+                document.getElementById('signTime').textContent =
+                    data.timeSynced ? data.time + ' (' + data.timeZone + ')' : 'not synced yet';
+                updateActiveLabel(data.activeQueue);
+                renderAll();
             });
 
-        function renderQueue() {
+        function curQueue() {
+            return queues[currentQueue];
+        }
+
+        function updateActiveLabel(idx) {
+            document.getElementById('activeQueueLabel').textContent =
+                (idx >= 0 && queues[idx]) ? queues[idx].name : 'None';
+        }
+
+        function renderAll() {
+            renderQueueSelect();
+            renderQueueEditor();
+            renderSchedules();
+            renderBootSelect();
+            updatePreview();
+        }
+
+        function renderQueueSelect() {
+            document.getElementById('queueSelect').innerHTML = queues.map((q, i) =>
+                `<option value="${i}" ${i === currentQueue ? 'selected' : ''}>${i + 1}. ${q.name}</option>`
+            ).join('');
+        }
+
+        function renderQueueEditor() {
+            const q = curQueue();
+            if (!q) return;
+            document.getElementById('queueName').value = q.name;
+
+            const chained = q.runTimes > 0 && q.nextQueue >= 0;
+            document.getElementById('finishMode').value = chained ? 'next' : 'loop';
+            document.getElementById('finishOptions').style.display = chained ? 'block' : 'none';
+            document.getElementById('runTimes').value = q.runTimes || 1;
+
+            const nq = document.getElementById('nextQueue');
+            nq.innerHTML = queues.map((o, i) =>
+                i === currentQueue ? '' :
+                `<option value="${i}" ${i === q.nextQueue ? 'selected' : ''}>${o.name}</option>`
+            ).join('') || '<option value="-1">No other queues</option>';
+            // Keep the model in sync with what the dropdown can actually show
+            nq.value = String(q.nextQueue);
+            if (nq.value !== String(q.nextQueue)) q.nextQueue = parseInt(nq.value);
+            if (isNaN(q.nextQueue)) q.nextQueue = -1;
+
+            renderMessages();
+        }
+
+        function renderMessages() {
             const container = document.getElementById('queueContainer');
             container.innerHTML = '';
+            const q = curQueue();
+            if (!q) return;
 
-            queueMessages.forEach((msg, index) => {
+            q.messages.forEach((msg, index) => {
                 const div = document.createElement('div');
                 div.style.cssText = 'border: 2px solid #000; padding: 10px; margin-bottom: 10px; background: #f9f9f9;';
                 div.innerHTML = `
@@ -898,78 +1062,241 @@ void setupWebServer()
                             <button type="button" onclick="removeMessage(${index})" style="width: auto; padding: 5px 10px; background: #ff0000;">Remove</button>
                         </div>
                     </div>
-                    <label style="font-size: 12px;">Command:</label>
+                    <label style="font-size: 12px;">Message Command:</label>
                     <input type="text" value="${msg.command || ''}" onchange="updateCommand(${index}, this.value)"
-                           style="width: 100%; margin-bottom: 5px;" placeholder="<CG><FQ>Hello World">
-                    <label style="font-size: 12px;">Duration (seconds):</label>
-                    <input type="number" value="${msg.duration || 5}" min="1"
+                           style="width: 100%; margin-bottom: 5px;" placeholder="&lt;FB&gt;&lt;CC&gt;&lt;SJ&gt;Hello World">
+                    <label style="font-size: 12px;">Pause after (seconds, ~2s per &lt;FP&gt;):</label>
+                    <input type="number" value="${msg.duration || 0}" min="0"
                            onchange="updateDuration(${index}, this.value)" style="width: 100px;">
                 `;
                 container.appendChild(div);
             });
         }
 
+        function renderBootSelect() {
+            document.getElementById('bootQueue').innerHTML = '<option value="-1">None</option>' +
+                queues.map((q, i) =>
+                    `<option value="${i}" ${i === bootQueue ? 'selected' : ''}>${q.name}</option>`
+                ).join('');
+        }
+
+        function renderSchedules() {
+            const container = document.getElementById('scheduleContainer');
+            container.innerHTML = '';
+            schedules.forEach((s, i) => {
+                const div = document.createElement('div');
+                div.style.cssText = 'border: 2px solid #000; padding: 10px; margin-bottom: 10px; background: #f9f9f9;';
+                const hh = String(s.hour).padStart(2, '0') + ':' + String(s.minute).padStart(2, '0');
+                let daysHtml = '';
+                DAY_LABELS.forEach((lbl, d) => {
+                    daysHtml += `<label style="display: inline; margin-right: 8px; font-weight: normal; font-size: 12px;"><input type="checkbox" style="width: auto;" ${(s.days >> d) & 1 ? 'checked' : ''} onchange="toggleDay(${i}, ${d}, this.checked)"> ${lbl}</label>`;
+                });
+                div.innerHTML = `
+                    <div style="display: flex; gap: 5px; flex-wrap: wrap; align-items: center; margin-bottom: 5px;">
+                        <select onchange="schedules[${i}].queue = parseInt(this.value)" style="width: auto; flex: 1; min-width: 120px;">
+                            <option value="-1" ${s.queue < 0 ? 'selected' : ''}>Choose queue...</option>
+                            ${queues.map((q, qi) => `<option value="${qi}" ${qi === s.queue ? 'selected' : ''}>${q.name}</option>`).join('')}
+                        </select>
+                        <input type="time" value="${hh}" onchange="setScheduleTime(${i}, this.value)" style="width: auto;">
+                        <label style="display: inline; font-weight: normal; font-size: 12px;"><input type="checkbox" style="width: auto;" ${s.enabled ? 'checked' : ''} onchange="schedules[${i}].enabled = this.checked"> On</label>
+                        <button type="button" onclick="removeSchedule(${i})" style="width: auto; padding: 3px 8px; margin-top: 0; background: #ff0000;">X</button>
+                    </div>
+                    <div>${daysHtml}</div>
+                `;
+                container.appendChild(div);
+            });
+        }
+
+        // Sync the visible queue editor inputs back into the model
+        function syncQueueInputs() {
+            const q = curQueue();
+            if (!q) return;
+            q.name = document.getElementById('queueName').value;
+            q.runTimes = parseInt(document.getElementById('runTimes').value) || 0;
+            q.nextQueue = parseInt(document.getElementById('nextQueue').value);
+            if (isNaN(q.nextQueue)) q.nextQueue = -1;
+            if (document.getElementById('finishMode').value === 'loop') {
+                q.runTimes = 0;
+                q.nextQueue = -1;
+            }
+        }
+
+        function selectQueue(i) {
+            syncQueueInputs();
+            currentQueue = parseInt(i);
+            renderAll();
+        }
+
+        function addQueue() {
+            if (queues.length >= maxQueues) {
+                alert('Maximum ' + maxQueues + ' queues');
+                return;
+            }
+            syncQueueInputs();
+            queues.push({ name: 'Queue ' + (queues.length + 1), runTimes: 0, nextQueue: -1, messages: [] });
+            currentQueue = queues.length - 1;
+            renderAll();
+        }
+
+        function removeQueue() {
+            if (queues.length <= 1) {
+                alert('At least one queue is required');
+                return;
+            }
+            if (!confirm('Delete "' + curQueue().name + '"?')) return;
+            queues.splice(currentQueue, 1);
+            // Fix index references to the deleted queue
+            queues.forEach(q => {
+                if (q.nextQueue === currentQueue) q.nextQueue = -1;
+                else if (q.nextQueue > currentQueue) q.nextQueue--;
+            });
+            schedules.forEach(s => {
+                if (s.queue === currentQueue) s.queue = -1;
+                else if (s.queue > currentQueue) s.queue--;
+            });
+            if (bootQueue === currentQueue) bootQueue = -1;
+            else if (bootQueue > currentQueue) bootQueue--;
+            if (currentQueue >= queues.length) currentQueue = queues.length - 1;
+            renderAll();
+        }
+
+        function updateQueueName(v) {
+            curQueue().name = v;
+            renderQueueSelect();
+            renderBootSelect();
+            renderSchedules(); // queue names appear in schedule dropdowns
+        }
+
+        function updateFinishMode() {
+            const chained = document.getElementById('finishMode').value === 'next';
+            document.getElementById('finishOptions').style.display = chained ? 'block' : 'none';
+            syncQueueInputs();
+            updatePreview();
+        }
+
+        function updateRunTimes(v) {
+            const d = parseInt(v);
+            curQueue().runTimes = isNaN(d) ? 1 : Math.min(99, Math.max(1, d));
+            updatePreview();
+        }
+
+        function updateNextQueue(v) {
+            curQueue().nextQueue = parseInt(v);
+            updatePreview();
+        }
+
         function addMessage() {
-            queueMessages.push({ command: '', duration: 5 });
-            renderQueue();
+            curQueue().messages.push({ command: '', duration: 4 });
+            renderMessages();
+            updatePreview();
         }
 
         function removeMessage(index) {
-            queueMessages.splice(index, 1);
-            renderQueue();
+            curQueue().messages.splice(index, 1);
+            renderMessages();
+            updatePreview();
         }
 
         function updateCommand(index, value) {
-            queueMessages[index].command = value;
+            curQueue().messages[index].command = value;
+            updatePreview();
         }
 
         function updateDuration(index, value) {
-            queueMessages[index].duration = parseInt(value) || 5;
+            const d = parseInt(value);
+            curQueue().messages[index].duration = isNaN(d) ? 4 : Math.max(0, d);
+            updatePreview();
+        }
+
+        function setScheduleTime(i, v) {
+            const parts = v.split(':');
+            schedules[i].hour = parseInt(parts[0]) || 0;
+            schedules[i].minute = parseInt(parts[1]) || 0;
+        }
+
+        function toggleDay(i, d, on) {
+            if (on) schedules[i].days |= (1 << d);
+            else schedules[i].days &= ~(1 << d);
+        }
+
+        function addSchedule() {
+            schedules.push({ queue: -1, hour: 18, minute: 0, days: 127, enabled: true });
+            renderSchedules();
+        }
+
+        function removeSchedule(i) {
+            schedules.splice(i, 1);
+            renderSchedules();
+        }
+
+        function buildCompiledCommand() {
+            const q = curQueue();
+            if (!q) return '';
+            let cmd = '<P' + RUN_PAGE + '>';
+            q.messages.forEach(m => {
+                const pauses = Math.max(0, Math.round((m.duration || 0) / 2));
+                const seg = (m.command || '').replace(/^<P[A-Z]>/, '');
+                cmd += seg + '<FP>'.repeat(pauses);
+            });
+            let run = '<RP' + RUN_PAGE + '>';
+            if (q.runTimes > 0 && q.nextQueue >= 0 && queues[q.nextQueue]) {
+                run = '<RP' + RUN_PAGE + '><' +
+                      String(q.runTimes).padStart(2, '0') + '><RP' + CHAIN_PAGE + '>';
+            }
+            return cmd + '\n' + run;
+        }
+
+        function updatePreview() {
+            document.getElementById('compiledPreview').value = buildCompiledCommand();
+        }
+
+        async function saveAll() {
+            syncQueueInputs();
+            return await fetch('/api/messages', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ queues, schedules, bootQueue })
+            });
         }
 
         async function testMessage(index) {
-            const msg = queueMessages[index];
+            const msg = curQueue().messages[index];
             if (!msg.command) {
                 alert('Please enter a command first');
                 return;
             }
 
+            const pauses = Math.max(0, Math.round((msg.duration || 0) / 2));
+            const seg = msg.command.replace(/^<P[A-Z]>/, '');
             try {
-                const response = await fetch('/api/send', {
+                await fetch('/api/send', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ command: '<PA>' + msg.command })
+                    body: JSON.stringify({ command: '<P' + TEST_PAGE + '>' + seg + '<FP>'.repeat(pauses) })
                 });
-
-                if (response.ok) {
-                    console.log('Test message sent successfully');
-                } else {
-                    alert('Failed to send test message');
-                }
+                const run = await fetch('/api/send', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ command: '<RP' + TEST_PAGE + '>' })
+                });
+                if (!run.ok) alert('Failed to send test message');
             } catch (err) {
                 alert('Error: ' + err.message);
             }
         }
 
-        document.getElementById('messageForm').addEventListener('submit', async (e) => {
+        document.getElementById('queueForm').addEventListener('submit', async (e) => {
             e.preventDefault();
             const status = document.getElementById('saveStatus');
-            const runOnBoot = document.getElementById('runOnBoot').checked;
 
             try {
-                const response = await fetch('/api/messages', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ messages: queueMessages, runOnBoot })
-                });
-
+                const response = await saveAll();
                 if (response.ok) {
                     status.className = 'status success';
-                    status.textContent = 'Queue saved!';
-                    document.getElementById('messageCount').textContent = queueMessages.length;
+                    status.textContent = 'Saved!';
                 } else {
                     status.className = 'status error';
-                    status.textContent = 'Failed to save queue';
+                    status.textContent = 'Failed to save';
                 }
             } catch (err) {
                 status.className = 'status error';
@@ -977,14 +1304,26 @@ void setupWebServer()
             }
         });
 
-        async function startQueue() {
+        async function startSelected() {
             const status = document.getElementById('loopControlStatus');
+            if (!curQueue() || curQueue().messages.length === 0) {
+                status.className = 'status error';
+                status.textContent = 'Selected queue has no messages';
+                return;
+            }
             try {
-                const response = await fetch('/api/loop/start', { method: 'POST' });
+                // Save first so the sign runs what you see in the editor
+                const save = await saveAll();
+                if (!save.ok) {
+                    status.className = 'status error';
+                    status.textContent = 'Failed to save queue';
+                    return;
+                }
+                const response = await fetch('/api/loop/start?queue=' + currentQueue, { method: 'POST' });
                 if (response.ok) {
                     status.className = 'status success';
                     status.textContent = 'Queue started!';
-                    document.getElementById('loopStatus').textContent = 'Running';
+                    updateActiveLabel(currentQueue);
                 } else {
                     status.className = 'status error';
                     status.textContent = 'Failed to start queue';
@@ -1002,7 +1341,7 @@ void setupWebServer()
                 if (response.ok) {
                     status.className = 'status success';
                     status.textContent = 'Queue stopped!';
-                    document.getElementById('loopStatus').textContent = 'Stopped';
+                    updateActiveLabel(-1);
                 } else {
                     status.className = 'status error';
                     status.textContent = 'Failed to stop queue';
@@ -1178,6 +1517,23 @@ void setupWebServer()
                         AP-Only Mode (no WiFi connection)
                     </label>
                 </div>
+                <div class="form-group">
+                    <label>Timezone (for queue scheduling)</label>
+                    <select id="tzPreset" name="tzPreset" onchange="tzPresetChanged()">
+                        <option value="">Custom</option>
+                        <option value="UTC0">UTC</option>
+                        <option value="EST5EDT,M3.2.0,M11.1.0">US Eastern</option>
+                        <option value="CST6CDT,M3.2.0,M11.1.0">US Central</option>
+                        <option value="MST7MDT,M3.2.0,M11.1.0">US Mountain</option>
+                        <option value="PST8PDT,M3.2.0,M11.1.0">US Pacific</option>
+                        <option value="AKST9AKDT,M3.2.0,M11.1.0">US Alaska</option>
+                        <option value="HST10">US Hawaii</option>
+                        <option value="GMT0BST,M3.5.0/1,M10.5.0">UK</option>
+                        <option value="CET-1CEST,M3.5.0,M10.5.0/3">Central Europe</option>
+                        <option value="AEST-10AEDT,M10.1.0,M4.1.0/3">Australia Eastern</option>
+                    </select>
+                    <input type="text" id="timeZone" name="timeZone" placeholder="POSIX TZ string" style="margin-top: 5px;">
+                </div>
                 <button type="submit">Save Settings</button>
                 <div id="settingsStatus" class="status"></div>
             </form>
@@ -1223,6 +1579,19 @@ void setupWebServer()
         document.getElementById('baudRate').value = ')rawliteral" + String(baudRate) + R"rawliteral(';
         document.getElementById('startBlank').checked = )rawliteral" + String(startBlank ? "true" : "false") + R"rawliteral(;
         document.getElementById('apOnlyMode').checked = )rawliteral" + String(apOnlyMode ? "true" : "false") + R"rawliteral(;
+        document.getElementById('timeZone').value = ')rawliteral" + timeZone + R"rawliteral(';
+        (function() {
+            const sel = document.getElementById('tzPreset');
+            const cur = document.getElementById('timeZone').value;
+            for (const opt of sel.options) {
+                if (opt.value && opt.value === cur) { sel.value = opt.value; break; }
+            }
+        })();
+
+        function tzPresetChanged() {
+            const v = document.getElementById('tzPreset').value;
+            if (v) document.getElementById('timeZone').value = v;
+        }
 
         // Get IP address
         fetch('/api/info')
@@ -1239,6 +1608,7 @@ void setupWebServer()
             const baudRate = document.getElementById('baudRate').value;
             const startBlank = document.getElementById('startBlank').checked;
             const apOnlyMode = document.getElementById('apOnlyMode').checked;
+            const timeZone = document.getElementById('timeZone').value;
 
             try {
                 const response = await fetch('/api/settings', {
@@ -1248,7 +1618,8 @@ void setupWebServer()
                         signID,
                         baudRate: parseInt(baudRate),
                         startBlank,
-                        apOnlyMode
+                        apOnlyMode,
+                        timeZone
                     })
                 });
 
@@ -1359,6 +1730,11 @@ void setupWebServer()
 
             sendToProlite(command);
 
+            // Commands that write, run, or delete pages supersede the running queue
+            if (command.indexOf("<P") >= 0 || command.indexOf("<R") >= 0 || command.indexOf("<D") >= 0) {
+                activeQueue = -1;
+            }
+
             // Save this command as the last display state (without ID wrapper)
             preferences.begin("faux-lite", false);
             preferences.putString("lastDisplay", command);
@@ -1381,12 +1757,15 @@ void setupWebServer()
             int newBaudRate = doc["baudRate"].as<int>();
             bool newStartBlank = doc["startBlank"].as<bool>();
             bool newApOnlyMode = doc["apOnlyMode"].as<bool>();
+            String newTimeZone = doc["timeZone"].as<String>();
+            if (newTimeZone.isEmpty()) newTimeZone = "UTC0";
 
             preferences.begin("faux-lite", false);
             preferences.putString("signID", newSignID);
             preferences.putInt("baudRate", newBaudRate);
             preferences.putBool("startBlank", newStartBlank);
             preferences.putBool("apOnlyMode", newApOnlyMode);
+            preferences.putString("timeZone", newTimeZone);
             preferences.end();
 
             request->send(200, "application/json", "{\"status\":\"success\"}");
@@ -1405,73 +1784,72 @@ void setupWebServer()
         doc["baud_rate"] = baudRate;
         doc["ip"] = WiFi.localIP().toString();
         doc["mac"] = WiFi.macAddress();
+        doc["timezone"] = timeZone;
+        doc["time"] = getLocalTimeString();
 
         String response;
         serializeJson(doc, response);
         request->send(200, "application/json", response); });
 
-    // API endpoint for message list GET
+    // API endpoint for queue/schedule list GET
     server.on("/api/messages", HTTP_GET, [](AsyncWebServerRequest *request)
               {
-        StaticJsonDocument<4096> doc;
-        JsonArray messagesArray = doc.createNestedArray("messages");
+        DynamicJsonDocument doc(32768);
+        serializeQueuesTo(doc);
 
-        for (size_t i = 0; i < messageQueue.size(); i++) {
-            JsonObject msg = messagesArray.createNestedObject();
-            msg["command"] = messageQueue[i].command;
-            msg["duration"] = messageQueue[i].duration;
-        }
-
-        doc["runOnBoot"] = runMessagesOnBoot;
-        doc["queueActive"] = queueActive;
-        doc["queueSize"] = messageQueue.size();
+        doc["activeQueue"] = activeQueue;
+        doc["maxQueues"] = MAX_QUEUES;
+        doc["runPage"] = String(RUN_PAGE);
+        doc["chainPage"] = String(CHAIN_PAGE);
+        doc["time"] = getLocalTimeString();
+        doc["timeSynced"] = timeSynced;
+        doc["timeZone"] = timeZone;
 
         String response;
         serializeJson(doc, response);
         request->send(200, "application/json", response); });
 
-    // API endpoint for message queue POST
+    // API endpoint for queues/schedules POST
     server.on("/api/messages", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
               {
-            StaticJsonDocument<8192> doc;
-            DeserializationError error = deserializeJson(doc, data, len);
+            // Accumulate the body - large queue sets arrive in multiple chunks
+            String *body;
+            if (index == 0) {
+                request->_tempObject = new String();
+                ((String *)request->_tempObject)->reserve(total);
+            }
+            body = (String *)request->_tempObject;
+            body->concat((const char *)data, len);
+            if (index + len < total)
+                return;
+
+            DynamicJsonDocument doc(32768);
+            DeserializationError error = deserializeJson(doc, *body);
+            delete body;
+            request->_tempObject = NULL;
 
             if (error) {
                 request->send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
                 return;
             }
 
-            JsonArray messagesArray = doc["messages"];
-            bool newRunOnBoot = doc["runOnBoot"].as<bool>();
-
-            // Clear and rebuild queue
-            messageQueue.clear();
-            for (JsonVariant v : messagesArray) {
-                JsonObject msg = v.as<JsonObject>();
-                QueueMessage qm;
-                qm.command = msg["command"].as<String>();
-                qm.duration = msg["duration"].as<int>();
-                if (qm.duration < 1) qm.duration = 5;
-                messageQueue.push_back(qm);
-            }
-
-            // Save to preferences
-            runMessagesOnBoot = newRunOnBoot;
-            preferences.begin("faux-lite", false);
-            preferences.putBool("runOnBoot", newRunOnBoot);
-            preferences.end();
-            saveQueueToPreferences();
+            parseQueuesJson(doc);
+            saveQueues();
 
             request->send(200, "application/json", "{\"status\":\"success\"}"); });
 
-    // API endpoint to start queue
+    // API endpoint to start a queue (?queue=N, default 0)
     server.on("/api/loop/start", HTTP_POST, [](AsyncWebServerRequest *request)
               {
-        if (messageQueue.size() > 0) {
-            startQueue();
+        int index = 0;
+        if (request->hasParam("queue")) {
+            index = request->getParam("queue")->value().toInt();
+        }
+        if (index >= 0 && index < (int)queues.size() && queues[index].messages.size() > 0) {
+            startQueue(index);
             request->send(200, "application/json", "{\"status\":\"success\"}");
         } else {
-            request->send(400, "application/json", "{\"error\":\"No messages in queue\"}");
+            request->send(400, "application/json", "{\"error\":\"Queue empty or invalid\"}");
         } });
 
     // API endpoint to stop queue
@@ -1531,7 +1909,7 @@ void displayMessage(String text, String color, String function)
     // Build Pro-Lite command for page A with specified color and function
     // Note: Page A is already running from boot, so we just update the content
     // Trailing space ensures gap between end and beginning when looping
-    String command = "<PA><F" + color + "><F" + function + ">" + text + " ";
+    String command = "<PA><C" + color + "><F" + function + ">" + text + " ";
     sendToProlite(command);
 }
 
@@ -1622,71 +2000,334 @@ void handleOTAUpload(AsyncWebServerRequest *request, String filename, size_t ind
     }
 }
 
-void startQueue()
+String buildQueuePageCommand(int index, char page)
 {
-    if (messageQueue.size() == 0)
+    // A single page can hold multiple messages: each <Fx> tag starts a new
+    // message, and <FP> holds the preceding text for ~2 seconds.
+    String command = "<P" + String(page) + ">";
+    for (size_t i = 0; i < queues[index].messages.size(); i++)
     {
-        Serial.println("Queue is empty, nothing to run");
+        String segment = queues[index].messages[i].command;
+        // Strip a leading page tag if present - segments share a single page
+        if (segment.length() >= 4 && segment[0] == '<' && segment[1] == 'P' &&
+            segment[2] >= 'A' && segment[2] <= 'Z' && segment[3] == '>')
+        {
+            segment = segment.substring(4);
+        }
+        command += segment;
+        int pauses = (queues[index].messages[i].duration + 1) / 2; // ~2s per <FP>
+        for (int p = 0; p < pauses; p++)
+        {
+            command += "<FP>";
+        }
+    }
+    return command;
+}
+
+void startQueue(int index)
+{
+    if (index < 0 || index >= (int)queues.size() || queues[index].messages.size() == 0)
+    {
+        Serial.println("Queue empty or invalid, nothing to run");
         return;
     }
 
-    queueActive = true;
-    currentQueueIndex = 0;
-    lastQueueTime = millis();
+    MessageQueue &q = queues[index];
+    bool validNext = q.runTimes > 0 && q.nextQueue >= 0 &&
+                     q.nextQueue < (int)queues.size() && q.nextQueue != index &&
+                     queues[q.nextQueue].messages.size() > 0;
 
-    // Display first message
-    sendToProlite("<PA>" + messageQueue[0].command);
-    Serial.printf("Queue started with %d messages\n", messageQueue.size());
+    // Write this queue to the run page (and the chain target to its page)
+    sendToProlite(buildQueuePageCommand(index, RUN_PAGE));
+    delay(100);
+    if (validNext)
+    {
+        sendToProlite(buildQueuePageCommand(q.nextQueue, CHAIN_PAGE));
+        delay(100);
+    }
+
+    // Run the page; optionally loop N times then switch to the chained queue
+    String run = "<RP" + String(RUN_PAGE) + ">";
+    if (validNext)
+    {
+        String nn = String(q.runTimes);
+        if (q.runTimes < 10)
+            nn = "0" + nn;
+        run += "<" + nn + "><RP" + String(CHAIN_PAGE) + ">";
+    }
+    sendToProlite(run);
+
+    activeQueue = index;
+    Serial.printf("Queue %d ('%s') started: %d messages\n",
+                  index, q.name.c_str(), q.messages.size());
 }
 
 void stopQueue()
 {
-    queueActive = false;
+    activeQueue = -1;
+    blankDisplay();
     Serial.println("Queue stopped");
 }
 
-void saveQueueToPreferences()
+void checkSchedules()
 {
-    preferences.begin("faux-lite", false);
-
-    // Save queue size
-    preferences.putInt("queueSize", messageQueue.size());
-
-    // Save each message in the queue
-    for (size_t i = 0; i < messageQueue.size(); i++)
+    // Wait for NTP sync before evaluating schedules
+    if (!timeSynced)
     {
-        String cmdKey = "qCmd" + String(i);
-        String durKey = "qDur" + String(i);
-        preferences.putString(cmdKey.c_str(), messageQueue[i].command);
-        preferences.putInt(durKey.c_str(), messageQueue[i].duration);
+        if (time(nullptr) > 1700000000)
+        {
+            timeSynced = true;
+            Serial.printf("Time synced: %s\n", getLocalTimeString().c_str());
+        }
+        else
+        {
+            return;
+        }
     }
+    if (schedules.empty())
+        return;
 
-    preferences.end();
-    Serial.printf("Saved queue with %d messages to preferences\n", messageQueue.size());
+    time_t now = time(nullptr);
+    struct tm t;
+    localtime_r(&now, &t);
+
+    // Evaluate at most once per minute
+    if (t.tm_min == lastCheckedMinute)
+        return;
+    lastCheckedMinute = t.tm_min;
+
+    for (size_t i = 0; i < schedules.size(); i++)
+    {
+        QueueSchedule &s = schedules[i];
+        if (!s.enabled || s.queue < 0 || s.queue >= (int)queues.size())
+            continue;
+        if (!(s.days & (1 << t.tm_wday)))
+            continue;
+        if (s.hour == t.tm_hour && s.minute == t.tm_min)
+        {
+            Serial.printf("Schedule fired: queue %d at %02d:%02d\n", s.queue, s.hour, s.minute);
+            startQueue(s.queue);
+            break;
+        }
+    }
 }
 
-void loadQueueFromPreferences()
+String getLocalTimeString()
 {
-    preferences.begin("faux-lite", true);
+    struct tm t;
+    if (!getLocalTime(&t, 10))
+        return "not synced";
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%02d:%02d:%02d", t.tm_hour, t.tm_min, t.tm_sec);
+    return String(buf);
+}
 
-    // Load queue size
-    int savedQueueSize = preferences.getInt("queueSize", 0);
-
-    // Clear and load messages
-    messageQueue.clear();
-    for (int i = 0; i < savedQueueSize; i++)
+void serializeQueuesTo(JsonDocument &doc)
+{
+    JsonArray queuesArray = doc.createNestedArray("queues");
+    for (size_t i = 0; i < queues.size(); i++)
     {
-        String cmdKey = "qCmd" + String(i);
-        String durKey = "qDur" + String(i);
-        QueueMessage qm;
-        qm.command = preferences.getString(cmdKey.c_str(), "");
-        qm.duration = preferences.getInt(durKey.c_str(), 5);
-        if (!qm.command.isEmpty())
+        JsonObject q = queuesArray.createNestedObject();
+        q["name"] = queues[i].name;
+        q["runTimes"] = queues[i].runTimes;
+        q["nextQueue"] = queues[i].nextQueue;
+        JsonArray msgs = q.createNestedArray("messages");
+        for (size_t j = 0; j < queues[i].messages.size(); j++)
         {
-            messageQueue.push_back(qm);
+            JsonObject m = msgs.createNestedObject();
+            m["command"] = queues[i].messages[j].command;
+            m["duration"] = queues[i].messages[j].duration;
         }
     }
 
+    JsonArray schedsArray = doc.createNestedArray("schedules");
+    for (size_t i = 0; i < schedules.size(); i++)
+    {
+        JsonObject s = schedsArray.createNestedObject();
+        s["queue"] = schedules[i].queue;
+        s["hour"] = schedules[i].hour;
+        s["minute"] = schedules[i].minute;
+        s["days"] = schedules[i].days;
+        s["enabled"] = schedules[i].enabled;
+    }
+
+    doc["bootQueue"] = bootQueue;
+}
+
+bool parseQueuesJson(JsonDocument &doc)
+{
+    JsonArray queuesArray = doc["queues"];
+
+    queues.clear();
+    for (JsonVariant v : queuesArray)
+    {
+        if (queues.size() >= MAX_QUEUES)
+            break;
+        JsonObject qj = v.as<JsonObject>();
+        MessageQueue q;
+        q.name = qj["name"].as<String>();
+        if (q.name.isEmpty())
+            q.name = "Queue " + String(queues.size() + 1);
+        q.runTimes = qj["runTimes"] | 0;
+        if (q.runTimes < 0)
+            q.runTimes = 0;
+        if (q.runTimes > 99)
+            q.runTimes = 99;
+        q.nextQueue = qj["nextQueue"] | -1;
+        JsonArray msgs = qj["messages"];
+        for (JsonVariant mv : msgs)
+        {
+            JsonObject mj = mv.as<JsonObject>();
+            QueueMessage m;
+            m.command = mj["command"].as<String>();
+            m.duration = mj["duration"] | 4;
+            if (m.duration < 0)
+                m.duration = 0;
+            q.messages.push_back(m);
+        }
+        queues.push_back(q);
+    }
+
+    schedules.clear();
+    JsonArray schedsArray = doc["schedules"];
+    for (JsonVariant v : schedsArray)
+    {
+        if (schedules.size() >= MAX_SCHEDULES)
+            break;
+        JsonObject sj = v.as<JsonObject>();
+        QueueSchedule s;
+        s.queue = sj["queue"] | -1;
+        s.hour = sj["hour"] | 0;
+        s.minute = sj["minute"] | 0;
+        s.days = sj["days"] | 0;
+        s.enabled = sj["enabled"] | true;
+        if (s.hour < 0)
+            s.hour = 0;
+        if (s.hour > 23)
+            s.hour = 23;
+        if (s.minute < 0)
+            s.minute = 0;
+        if (s.minute > 59)
+            s.minute = 59;
+        schedules.push_back(s);
+    }
+
+    bootQueue = doc["bootQueue"] | -1;
+    if (bootQueue >= (int)queues.size())
+        bootQueue = -1;
+    if (activeQueue >= (int)queues.size())
+        activeQueue = -1;
+
+    return true;
+}
+
+void saveQueues()
+{
+    File f = LittleFS.open(QUEUES_FILE, "w");
+    if (!f)
+    {
+        Serial.println("Failed to open " QUEUES_FILE " for writing");
+        return;
+    }
+
+    DynamicJsonDocument doc(32768);
+    serializeQueuesTo(doc);
+    serializeJson(doc, f);
+    f.close();
+    Serial.printf("Saved %d queues and %d schedules to " QUEUES_FILE "\n", queues.size(), schedules.size());
+}
+
+void loadQueues()
+{
+    queues.clear();
+    schedules.clear();
+    bootQueue = -1;
+
+    if (LittleFS.exists(QUEUES_FILE))
+    {
+        File f = LittleFS.open(QUEUES_FILE, "r");
+        DynamicJsonDocument doc(32768);
+        DeserializationError err = deserializeJson(doc, f);
+        f.close();
+        if (err)
+        {
+            Serial.printf("Failed to parse " QUEUES_FILE ": %s\n", err.c_str());
+            return;
+        }
+        parseQueuesJson(doc);
+        Serial.printf("Loaded %d queues and %d schedules from " QUEUES_FILE "\n", queues.size(), schedules.size());
+        return;
+    }
+
+    // No stored file - migrate queue data saved in NVS by older firmware
+    preferences.begin("faux-lite", true);
+
+    int numQueues = preferences.getInt("numQueues", 0);
+    for (int i = 0; i < numQueues; i++)
+    {
+        MessageQueue q;
+        String base = "q" + String(i);
+        q.name = preferences.getString((base + "n").c_str(), "Queue " + String(i + 1));
+        q.runTimes = preferences.getInt((base + "r").c_str(), 0);
+        q.nextQueue = preferences.getInt((base + "x").c_str(), -1);
+        int numMsgs = preferences.getInt((base + "m").c_str(), 0);
+        for (int j = 0; j < numMsgs; j++)
+        {
+            String mbase = base + "m" + String(j);
+            QueueMessage m;
+            m.command = preferences.getString((mbase + "c").c_str(), "");
+            m.duration = preferences.getInt((mbase + "d").c_str(), 4);
+            if (!m.command.isEmpty())
+                q.messages.push_back(m);
+        }
+        queues.push_back(q);
+    }
+
+    // Even older firmware: single software-timed queue
+    int oldSize = preferences.getInt("queueSize", 0);
+    if (queues.empty() && oldSize > 0)
+    {
+        MessageQueue q;
+        q.name = "Default";
+        for (int i = 0; i < oldSize; i++)
+        {
+            QueueMessage m;
+            m.command = preferences.getString(("qCmd" + String(i)).c_str(), "");
+            m.duration = preferences.getInt(("qDur" + String(i)).c_str(), 4);
+            if (!m.command.isEmpty())
+                q.messages.push_back(m);
+        }
+        if (!q.messages.empty())
+            queues.push_back(q);
+    }
+
+    bootQueue = preferences.getInt("bootQueue", -1);
+    // Migrate old runOnBoot flag: run the first queue
+    if (bootQueue == -1 && preferences.getBool("runOnBoot", false) && !queues.empty())
+        bootQueue = 0;
+    if (bootQueue >= (int)queues.size())
+        bootQueue = -1;
+
+    int numScheds = preferences.getInt("numScheds", 0);
+    for (int i = 0; i < numScheds && i < MAX_SCHEDULES; i++)
+    {
+        QueueSchedule s;
+        String base = "s" + String(i);
+        s.queue = preferences.getInt((base + "q").c_str(), -1);
+        s.hour = preferences.getInt((base + "h").c_str(), 0);
+        s.minute = preferences.getInt((base + "m").c_str(), 0);
+        s.days = preferences.getUChar((base + "d").c_str(), 0);
+        s.enabled = preferences.getBool((base + "e").c_str(), true);
+        schedules.push_back(s);
+    }
+
     preferences.end();
-    Serial.printf("Loaded queue with %d messages from preferences\n", messageQueue.size());
+
+    if (!queues.empty() || !schedules.empty())
+    {
+        Serial.println("Migrated queue data from NVS to LittleFS");
+        saveQueues();
+    }
+
+    Serial.printf("Loaded %d queues and %d schedules\n", queues.size(), schedules.size());
 }

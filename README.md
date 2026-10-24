@@ -11,7 +11,9 @@ WiFi-to-Serial bridge firmware for Pro-Lite LED displays. Turn any ESP32 into a 
 - 📡 **REST API** - Full automation support
 - 🔄 **OTA Updates** - Upload new firmware wirelessly
 - 📱 **WiFi Manager** - Easy WiFi setup with captive portal
-- 💾 **Message Queue** - Store and loop multiple messages
+- 💾 **Message Queues** - Up to 100 queues stored on the device, each looping multiple messages natively
+- ⏰ **Scheduling** - NTP-based scheduler starts queues at set times/days
+- 🔗 **Queue Chaining** - Run a queue N times, then automatically switch to another queue
 - 🎨 **Full Protocol Support** - All Pro-Lite colors, fonts, and animations
 - 🔊 **Beep Support** - Audible notifications
 - 📄 **26 Pages** - Store messages on pages A-Z
@@ -78,11 +80,15 @@ GND          → GND
 - **Send Raw Command**: Direct Pro-Lite protocol commands
 - **Protocol Guide**: Built-in reference for all commands
 
-### Message Queue (`/messages`)
+### Message Queues (`/messages`)
 
-- Store unlimited messages with timing
-- Loop messages continuously
-- Run on boot option
+- Create up to 100 named queues, stored on the device's flash (LittleFS)
+- A queue is compiled onto sign page A only when run - sign memory stays free
+- Messages in a queue are sequenced and looped by the sign itself - no software timing
+- Per-message pause via `<FP>` tags (~2 seconds each)
+- Run a queue a set number of times, then automatically switch to another queue
+- Schedule queues to start at set times on selected days (NTP-based)
+- Run-on-boot queue selection
 - Test individual messages
 - Edit and delete queue items
 
@@ -92,6 +98,7 @@ GND          → GND
 - **Baud Rate**: Adjust serial speed (default: 9600)
 - **Start Blank**: Clear display on boot
 - **AP-Only Mode**: Run without WiFi connection
+- **Timezone**: Set timezone for queue scheduling (NTP)
 - **OTA Update**: Upload new firmware wirelessly
 - **WiFi Reset**: Clear saved WiFi credentials
 
@@ -126,21 +133,30 @@ Response:
 
 ### Message Queue API
 
-**Get Queue:**
+**Get Queues & Schedules:**
 ```bash
 curl http://<device-ip>/api/messages
 ```
 
-**Update Queue:**
+**Update Queues & Schedules:**
+
+Queues are stored on the device's flash and compiled onto sign page A only when run.
+A message `command` is a *segment* on that page (function/color/font + text, without
+a `<Px>` page tag). `duration` is the pause in seconds after the message, converted to
+`<FP>` tags (~2 seconds each). Set `runTimes` > 0 with `nextQueue` to loop a queue N
+times then switch to another queue (the target is written to page B and the run
+command emits `<RPA><NN><RPB>`). `days` is a bitmask with bit 0 = Sunday through
+bit 6 = Saturday.
+
 ```bash
 curl -X POST http://<device-ip>/api/messages \
   -H "Content-Type: application/json" \
-  -d '{"messages":[{"command":"<PA>Test","duration":5000}],"runOnBoot":false}'
+  -d '{"queues":[{"name":"Show","runTimes":0,"nextQueue":-1,"messages":[{"command":"<FB><CC><SJ>Hello World","duration":0},{"command":"<FB><CL>Second Message:","duration":2},{"command":"<FS><CG>Scrolling Text","duration":2}]}],"schedules":[{"queue":0,"hour":18,"minute":0,"days":127,"enabled":true}],"bootQueue":0}'
 ```
 
-**Start/Stop Loop:**
+**Start/Stop Queue:**
 ```bash
-curl -X POST http://<device-ip>/api/loop/start
+curl -X POST "http://<device-ip>/api/loop/start?queue=0"
 curl -X POST http://<device-ip>/api/loop/stop
 ```
 
@@ -160,6 +176,16 @@ Where `##` is sign ID (default: 01)
 - **Animations**: `<FA>` Auto, `<FB>` Open, `<FQ>` Appear, etc.
 - **Run Page**: `<RPx>` - Display page x
 - **Beep**: `<FB>` - Audible beep
+- **Pause**: `<FP>` - Holds the preceding text for ~2 seconds
+
+### Multiple Messages Per Page
+
+A single page can hold multiple messages - each `<F?>` tag starts a new one,
+and the sign sequences through them automatically when the page runs:
+
+```
+<ID01><PA><FB><CC><SJ>Hello World<FP><FB><CL>Second Message:<FP><FP><FS><CC>Scrolling Text<FP>
+```
 
 Full protocol reference available in the web interface.
 
