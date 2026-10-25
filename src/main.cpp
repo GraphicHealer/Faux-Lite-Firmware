@@ -717,7 +717,7 @@ void setupWebServer()
             if (func) command += '<' + func + '>';
             if (color) command += '<' + color + '>';
             if (font) command += '<' + font + '>';
-            command += text + ' ';
+            command += text;
 
             try {
                 const response = await fetch('/api/send', {
@@ -2250,8 +2250,7 @@ void displayMessage(String text, String color, String function)
 {
     // Build Pro-Lite command for page A with specified color and function
     // Note: Page A is already running from boot, so we just update the content
-    // Trailing space ensures gap between end and beginning when looping
-    String command = "<PA><C" + color + "><F" + function + ">" + text + " ";
+    String command = "<PA><C" + color + "><F" + function + ">" + text;
     sendToProlite(command);
 }
 
