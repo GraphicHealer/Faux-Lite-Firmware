@@ -17,6 +17,12 @@
 // Use Serial1 (UART1) for ESP32-S2
 #define ProliteSerial Serial1
 
+// Time for the sign's internal boot sequence before we send commands.
+// Measured on hardware: internal boot text starts moving 7.5s after power-on
+// and is fully off screen at 8.7s. ESP32 reaches this delay ~1.5s after
+// power, so 7500ms puts our first command right as the sign's text clears.
+#define SIGN_BOOT_DELAY_MS 7500
+
 // Preferences storage
 Preferences preferences;
 
@@ -73,6 +79,10 @@ String timeZone = "UTC0"; // POSIX TZ string for NTP/scheduling
 bool timeSynced = false;
 int lastCheckedMinute = -1;
 
+// User-defined graphic blocks (A-Z), 126-char R/G/Y/B bitmaps; "" = built-in
+// default. Re-uploaded after every <D*> since the wipe restores defaults.
+String userGraphics[26];
+
 // Web server
 AsyncWebServer server(80);
 
@@ -84,8 +94,13 @@ void setupWiFi();
 void setupWebServer();
 void sendToProlite(String command);
 void displayMessage(String text, String color = "G", String function = "A");
-void displayBootMessage(String text, String color = "G", String function = "S", int times = 1);
+void displayBootMessage(String text, String color = "H", bool wifiIcon = false);
+void displayBootMessageRaw(String body);
+void sendWifiGraphic();
+void sendBlankGraphic();
+void sendSignGraphics();
 void blankDisplay();
+void wipeSign();
 void restoreLastDisplay();
 String getChipID();
 void handleOTAUpload(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final);
@@ -98,6 +113,9 @@ void serializeQueuesTo(JsonDocument &doc);
 bool parseQueuesJson(JsonDocument &doc);
 void saveQueues();
 void loadQueues();
+void loadUserGraphics();
+void sendUserGraphics();
+String sanitizeGraphicData(String data);
 
 void setup()
 {
@@ -121,6 +139,7 @@ void setup()
 
     // Load queues and schedules from storage
     loadQueues();
+    loadUserGraphics();
 
     preferences.begin("faux-lite", false);
 
@@ -134,17 +153,18 @@ void setup()
     ProliteSerial.begin(baudRate, SERIAL_8N1, RX_PIN, TX_PIN);
     Serial.printf("Pro-Lite UART initialized: %d baud, RX=%d, TX=%d\n", baudRate, RX_PIN, TX_PIN);
 
-    // Wait 10 seconds for Pro-Lite's internal boot sequence to complete
-    Serial.println("Waiting for Pro-Lite display boot sequence...");
-    delay(10000);
+    // Wait for Pro-Lite's internal boot sequence to complete
+    Serial.printf("Waiting %d ms for Pro-Lite display boot sequence...\n", SIGN_BOOT_DELAY_MS);
+    delay(SIGN_BOOT_DELAY_MS);
 
-    // Blank the display on boot
+    // Upload graphic blocks and blank the display on boot
     Serial.println("Blanking display...");
+    sendSignGraphics();
     blankDisplay();
     delay(500);
 
-    // Show boot message on temporary page (Page Z) that will auto-return to Page A
-    displayBootMessage("Faux-Lite Booting...", "H", "S", 3);
+    // Show boot branding on Page Z: "Faux" italic + "-Lite" bold, small, bright red
+    displayBootMessageRaw("<CC><FQ><SC><SJ>Faux<SB><SJ>-Lite");
     delay(3000); // Wait 3 seconds for message to display
 
     // Setup WiFi with captive portal
@@ -168,8 +188,7 @@ void setup()
     Serial.printf("mDNS Name: %s.local\n", mdnsName.c_str());
 
     // Display IP address on temporary page, show ~15 times (about 15 seconds) then return to Page A
-    String ipMsg = "IP: " + WiFi.localIP().toString();
-    displayBootMessage(ipMsg, "L", "S", 15);
+    displayBootMessage(WiFi.localIP().toString(), "L");
     delay(15000); // Wait 15 seconds for IP message to display
 
     // Handle boot display options
@@ -210,7 +229,7 @@ void setupWiFi()
     if (apOnlyMode)
     {
         Serial.println("AP-Only Mode enabled");
-        displayBootMessage("AP Mode: " + apName, "H", "S", 5);
+        displayBootMessage("AP: " + apName, "H", true);
         delay(5000); // Wait 5 seconds for AP mode message to display
 
         // Start in AP mode only
@@ -219,14 +238,13 @@ void setupWiFi()
         Serial.printf("AP Started: %s\n", apName.c_str());
         Serial.printf("AP IP: %s\n", WiFi.softAPIP().toString().c_str());
 
-        String apIpMsg = "AP IP: " + WiFi.softAPIP().toString();
-        displayBootMessage(apIpMsg, "L", "S", 10);
+        displayBootMessage(WiFi.softAPIP().toString(), "L");
         delay(10000); // Wait 10 seconds for AP IP message to display
         return;
     }
 
     // Show connecting message
-    displayBootMessage("Connecting WiFi...", "H", "S", 5);
+    displayBootMessage("Connecting", "H", true);
     delay(5000); // Wait 5 seconds for connecting message to display
 
     // Faux-Lite theme + options injected into the captive portal <head>.
@@ -264,13 +282,13 @@ void setupWiFi()
                      {
         Serial.println("Entered AP mode");
         String apMsg = "Connect to AP: " + apName;
-        displayBootMessage(apMsg, "C", "S", 10); });
+        displayBootMessage(apMsg, "C", true); });
 
     // Try to connect, if fails start AP
     if (!wm.autoConnect(apName.c_str()))
     {
         Serial.println("Failed to connect and hit timeout");
-        displayBootMessage("WiFi Timeout!", "C", "S", 5);
+        displayBootMessage("WiFi Timeout", "C", true);
         delay(3000);
         ESP.restart();
     }
@@ -284,7 +302,8 @@ void setupWiFi()
 
     // Show WiFi connected message
     String ssid = WiFi.SSID();
-    displayBootMessage("WiFi: " + ssid, "L", "S", 5);
+    displayBootMessage(ssid, "C", true);
+    delay(3000); // hold WiFi name on screen briefly before IP takes over
     delay(5000); // Wait 5 seconds for WiFi connected message to display
 }
 
@@ -598,6 +617,7 @@ void setupWebServer()
 
             <div class="settings-link">
                 <a href="/messages">Queues</a> |
+                <a href="/graphics">Graphics</a> |
                 <a href="/settings">Settings & OTA Update</a>
             </div>
         </div>
@@ -913,7 +933,9 @@ void setupWebServer()
                 sign only when run - the running queue always uses <strong>page A</strong>
                 (a chained next-queue uses <strong>page B</strong>).<br>
                 Messages in a queue are compiled into that single page - each
-                <code>&lt;F?&gt;</code> tag starts a new message and the sign loops them natively.<br>
+                <code>&lt;F?&gt;</code> tag starts a new message and the sign loops them natively.
+                Use the dropdowns to pick animation/color/font/size; tags like
+                <code>&lt;CG&gt;</code> can also be typed inline for mid-message changes.<br>
                 <strong>Pause After:</strong> seconds to hold each message - converted to
                 <code>&lt;FP&gt;</code> tags (~2 seconds each, rounded). Use 0 for no pause.<br>
                 Do not include <code>&lt;Px&gt;</code> page tags - they are stripped automatically.
@@ -990,6 +1012,7 @@ void setupWebServer()
         </div>
 
         <div class="back-link">
+            <a href="/graphics">Graphics</a> |
             <a href="/">← Back to Main</a>
         </div>
     </div>
@@ -1068,6 +1091,54 @@ void setupWebServer()
             renderMessages();
         }
 
+        const ANIM_OPTS = [['FA','Auto'],['FB','Open'],['FC','Cover'],['FD','Date'],['FE','Cycling'],['FF','Close Right'],['FG','Close Left'],['FH','Close Both'],['FI','Scroll Up'],['FJ','Scroll Down'],['FK','Overlap'],['FL','Stacking'],['FM','Comic 1'],['FN','Comic 2'],['FO','Beep'],['FP','Pause'],['FQ','Appear'],['FR','Random'],['FS','Shift Left'],['FT','Time'],['FU','Magic'],['FV','Thank You'],['FW','Welcome'],['FZ','Link Page'],['F1','Target'],['F2','Current'],['F3','Day Left'],['F4','Hour Left'],['F5','Minute Left'],['F6','Second Left']];
+        const COLOR_OPTS = [['CA','Dim Red'],['CB','Red'],['CC','Bright Red'],['CD','Orange'],['CE','Bright Orange'],['CF','Light Yellow'],['CG','Yellow'],['CH','Bright Yellow'],['CI','Lime'],['CJ','Dim Lime'],['CK','Bright Lime'],['CL','Bright Green'],['CM','Green'],['CN','Dim Green'],['CO','Yel/Grn/Red'],['CP','Rainbow'],['CQ','Red/Grn 3D'],['CR','Red/Yel 3D'],['CS','Grn/Red 3D'],['CT','Grn/Yel 3D'],['CU','Grn on Red'],['CV','Red on Grn'],['CW','Org on Grn 3D'],['CX','Lime on Red 3D'],['CY','Grn on Red 3D'],['CZ','Red on Grn 3D']];
+        const FONT_OPTS = [['SA','Normal'],['SB','Bold'],['SC','Italic'],['SD','Bold Italic'],['SE','Flash Normal'],['SF','Flash Bold'],['SG','Flash Italic'],['SH','Flash Bold Italic']];
+        const SIZE_OPTS = [['SI','5x7 (default)'],['SJ','4x7']];
+
+        function optList(opts, cur) {
+            return '<option value="">None</option>' + opts.map(o =>
+                `<option value="${o[0]}" ${o[0] === cur ? 'selected' : ''}>${o[1]}</option>`).join('');
+        }
+
+        // Split a stored segment command into leading tags + text
+        function parseSegment(cmd) {
+            const p = { anim: 'FA', color: 'CC', font: 'SA', size: 'SI', text: cmd || '' };
+            const m = (cmd || '').match(/^((?:<[A-Z][A-Z0-9]>)+)([\s\S]*)$/);
+            if (!m) return p;
+            p.text = m[2];
+            (m[1].match(/<[A-Z][A-Z0-9]>/g) || []).forEach(t => {
+                const k = t.slice(1, -1);
+                if (k[0] === 'F') p.anim = k;
+                else if (k[0] === 'C') p.color = k;
+                else if (k === 'SI' || k === 'SJ') p.size = k;
+                else if (k[0] === 'S') p.font = k;
+                else p.text = t + p.text; // unknown tag stays in the text
+            });
+            return p;
+        }
+
+        function buildSegment(p) {
+            let s = '';
+            if (p.anim) s += '<' + p.anim + '>';
+            if (p.color) s += '<' + p.color + '>';
+            if (p.font) s += '<' + p.font + '>';
+            if (p.size) s += '<' + p.size + '>';
+            return s + (p.text || '');
+        }
+
+        function partsOf(msg) {
+            if (!msg._parts) msg._parts = parseSegment(msg.command);
+            return msg._parts;
+        }
+
+        function updatePart(index, field, value) {
+            const msg = curQueue().messages[index];
+            partsOf(msg)[field] = value;
+            msg.command = buildSegment(partsOf(msg));
+            updatePreview();
+        }
+
         function renderMessages() {
             const container = document.getElementById('queueContainer');
             container.innerHTML = '';
@@ -1075,6 +1146,7 @@ void setupWebServer()
             if (!q) return;
 
             q.messages.forEach((msg, index) => {
+                const p = partsOf(msg);
                 const div = document.createElement('div');
                 div.style.cssText = 'border: 2px solid #000; padding: 10px; margin-bottom: 10px; background: #f9f9f9;';
                 div.innerHTML = `
@@ -1085,9 +1157,14 @@ void setupWebServer()
                             <button type="button" onclick="removeMessage(${index})" style="width: auto; padding: 5px 10px; background: #ff0000;">Remove</button>
                         </div>
                     </div>
-                    <label style="font-size: 12px;">Message Command:</label>
-                    <input type="text" value="${msg.command || ''}" onchange="updateCommand(${index}, this.value)"
-                           style="width: 100%; margin-bottom: 5px;" placeholder="&lt;FB&gt;&lt;CC&gt;&lt;SJ&gt;Hello World">
+                    <div style="display: flex; gap: 5px; margin-bottom: 5px;">
+                        <select style="flex: 1; min-width: 0;" title="Animation" onchange="updatePart(${index}, 'anim', this.value)">${optList(ANIM_OPTS, p.anim)}</select>
+                        <select style="flex: 1; min-width: 0;" title="Color" onchange="updatePart(${index}, 'color', this.value)">${optList(COLOR_OPTS, p.color)}</select>
+                        <select style="flex: 1; min-width: 0;" title="Font" onchange="updatePart(${index}, 'font', this.value)">${optList(FONT_OPTS, p.font)}</select>
+                        <select style="flex: 0.6; min-width: 0;" title="Size" onchange="updatePart(${index}, 'size', this.value)">${optList(SIZE_OPTS, p.size)}</select>
+                    </div>
+                    <input type="text" value="${p.text}" oninput="updatePart(${index}, 'text', this.value)"
+                           style="width: 100%; margin-bottom: 5px;" placeholder="Hello World">
                     <label style="font-size: 12px;">Pause after (seconds, ~2s per &lt;FP&gt;):</label>
                     <input type="number" value="${msg.duration || 0}" min="0"
                            onchange="updateDuration(${index}, this.value)" style="width: 100px;">
@@ -1209,7 +1286,7 @@ void setupWebServer()
         }
 
         function addMessage() {
-            curQueue().messages.push({ command: '', duration: 4 });
+            curQueue().messages.push({ command: '<FA><CC><SA><SI>', duration: 4 });
             renderMessages();
             updatePreview();
         }
@@ -1217,11 +1294,6 @@ void setupWebServer()
         function removeMessage(index) {
             curQueue().messages.splice(index, 1);
             renderMessages();
-            updatePreview();
-        }
-
-        function updateCommand(index, value) {
-            curQueue().messages[index].command = value;
             updatePreview();
         }
 
@@ -1382,6 +1454,185 @@ void setupWebServer()
         request->send(200, "text/html", html); });
 
     // Settings page
+    // Graphics builder page
+    server.on("/graphics", HTTP_GET, [](AsyncWebServerRequest *request)
+              {
+        String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Faux-Lite Graphics</title>
+    <style>
+        body { font-family: Arial, Helvetica, sans-serif; background: #FFFF00; color: #000; margin: 0; }
+        .navbar { background: #000; color: #FFFF00; padding: 10px; border: 3px solid #000; display: flex; align-items: center; }
+        .navbar img { height: 50px; margin-right: 15px; }
+        .navbar h1 { margin: 0; font-size: 24px; color: #FFFF00; }
+        .container { max-width: 700px; margin: 20px auto; padding: 0 10px; }
+        .panel { background: #FFF; padding: 15px; border: 3px solid #000; margin-bottom: 20px; }
+        .panel h2 { margin: 0 0 15px 0; padding-bottom: 5px; border-bottom: 2px solid #000; font-size: 18px; }
+        label { display: block; margin-bottom: 3px; font-weight: bold; }
+        button { background: #000; color: #FFFF00; padding: 8px 20px; border: 2px solid #000; cursor: pointer; font-size: 14px; font-weight: bold; margin: 4px 4px 0 0; }
+        button:hover { background: #333; }
+        button.danger { background: #FF0000; color: #FFF; }
+        select { padding: 5px; border: 2px solid #000; font-size: 14px; }
+        #grid { display: grid; grid-template-columns: repeat(18, 30px); gap: 2px; margin: 10px 0; user-select: none; width: max-content; }
+        .cell { width: 30px; height: 30px; border: 1px solid #AAA; cursor: crosshair; }
+        .swatch { display: inline-block; width: 34px; height: 34px; border: 3px solid #AAA; cursor: pointer; margin-right: 6px; vertical-align: middle; }
+        .swatch.sel { border-color: #000; }
+        .status { padding: 8px; margin-top: 10px; display: none; border: 2px solid #000; }
+        .status.success { background: #00FF00; display: block; }
+        .status.error { background: #FF0000; color: #FFF; display: block; }
+        .back-link { text-align: center; margin-top: 15px; }
+        .back-link a { color: #0000FF; text-decoration: underline; font-weight: bold; }
+        .info { background: #EEE; padding: 8px; border: 1px solid #000; font-size: 12px; margin-bottom: 10px; }
+        @media (max-width: 700px) {
+            #grid { grid-template-columns: repeat(18, 5vw); }
+            .cell { width: 5vw; height: 5vw; }
+        }
+    </style>
+</head>
+<body>
+    <div class="navbar">
+        <img src=")rawliteral" + logoUri + R"rawliteral(" alt="Icon" style="width: 86px; height: 40px; margin-right: 10px;">
+        <h1>Faux-Lite - Graphics</h1>
+    </div>
+    <div class="container">
+        <div class="panel">
+            <h2>Graphic Builder</h2>
+            <div class="info">
+                Design a custom 18x7 graphic block. Pick a letter, paint with the
+                palette (click or drag), then save to the sign. Insert it into
+                messages with &lt;BX&gt; where X is the block letter.<br>
+                Blocks B and W are used by the firmware (blank page / WiFi icon) -
+                a custom definition will override them.
+            </div>
+            <div class="form-group">
+                <label>Graphic Block</label>
+                <select id="block"></select>
+            </div>
+            <div style="margin: 10px 0;">
+                <b>Color:</b>
+                <span class="swatch" data-c="B" style="background:#111" onclick="setColor('B')" title="Black"></span>
+                <span class="swatch sel" data-c="R" style="background:#F00" onclick="setColor('R')" title="Red"></span>
+                <span class="swatch" data-c="G" style="background:#0C0" onclick="setColor('G')" title="Green"></span>
+                <span class="swatch" data-c="Y" style="background:#EE0" onclick="setColor('Y')" title="Yellow"></span>
+            </div>
+            <div id="grid"></div>
+            <button onclick="clearGrid()">Clear</button>
+            <button onclick="fillGrid()">Fill</button>
+            <button onclick="saveGfx()">Save to Sign</button>
+            <button class="danger" onclick="resetGfx()">Reset to Default</button>
+            <div style="margin-top: 15px;">
+                <label>Bitmap Data (copy to export, paste to import)</label>
+                <textarea id="gfxdata" rows="4" style="width:100%; font-family: monospace; font-size: 11px; padding: 5px; border: 2px solid #000;"></textarea>
+            </div>
+            <button onclick="importGfx()">Import</button>
+            <div id="status" class="status"></div>
+            <div class="back-link">
+                <a href="/messages">Queues</a> |
+                <a href="/">Back to Main</a>
+            </div>
+        </div>
+    </div>
+    <script>
+        const N = 126;
+        const COLORS = {B:'#111', R:'#F00', G:'#0C0', Y:'#EE0'};
+        let grid = Array(N).fill('B');
+        let color = 'R';
+        let painting = false;
+        let custom = {};
+
+        const sel = document.getElementById('block');
+        for (let i = 0; i < 26; i++) {
+            const l = String.fromCharCode(65 + i);
+            const o = document.createElement('option');
+            o.value = l; o.textContent = l; sel.appendChild(o);
+        }
+        sel.onchange = loadBlock;
+
+        const gEl = document.getElementById('grid');
+        for (let i = 0; i < N; i++) {
+            const c = document.createElement('div');
+            c.className = 'cell';
+            c.onmousedown = function(e){ e.preventDefault(); painting = true; paint(i); };
+            c.onmouseover = function(){ if (painting) paint(i); };
+            gEl.appendChild(c);
+        }
+        document.addEventListener('mouseup', () => painting = false);
+
+        function paint(i) {
+            grid[i] = color;
+            gEl.children[i].style.background = COLORS[color];
+            syncField();
+        }
+        function render() {
+            for (let i = 0; i < N; i++) gEl.children[i].style.background = COLORS[grid[i]];
+            syncField();
+        }
+        function syncField() {
+            document.getElementById('gfxdata').value = grid.join('');
+        }
+
+        // Import accepts a bare bitmap or a full <Gx>... command
+        function importGfx() {
+            let raw = document.getElementById('gfxdata').value.toUpperCase().trim();
+            const gt = raw.lastIndexOf('>');
+            if (raw.startsWith('<') && gt >= 0) raw = raw.slice(gt + 1);
+            const clean = raw.replace(/[^RGYB]/g, 'B');
+            if (clean.length === 0) { show('No bitmap data found', false); return; }
+            grid = Array(N).fill('B');
+            for (let i = 0; i < Math.min(clean.length, N); i++) grid[i] = clean[i];
+            render();
+            show('Imported - click Save to upload', true);
+        }
+        function setColor(c) {
+            color = c;
+            document.querySelectorAll('.swatch').forEach(s => s.classList.toggle('sel', s.dataset.c === c));
+        }
+        function clearGrid() { grid.fill('B'); render(); }
+        function fillGrid() { grid.fill(color); render(); }
+
+        function loadBlock() {
+            const d = custom[sel.value];
+            grid = Array(N).fill('B');
+            if (d) for (let i = 0; i < Math.min(d.length, N); i++) grid[i] = d[i];
+            render();
+        }
+
+        async function saveGfx() {
+            const r = await fetch('/api/graphics', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({block: sel.value, data: grid.join('')})});
+            if (r.ok) { custom[sel.value] = grid.join(''); refreshLabels(); show('Saved to sign!', true); }
+            else show('Save failed', false);
+        }
+        async function resetGfx() {
+            const r = await fetch('/api/graphics', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({block: sel.value, data: ''})});
+            if (r.ok) { delete custom[sel.value]; refreshLabels(); show('Reset to built-in default', true); }
+            else show('Reset failed', false);
+        }
+        function refreshLabels() {
+            for (const o of sel.options) o.textContent = o.value + (custom[o.value] ? ' (custom)' : '');
+        }
+        function show(msg, ok) {
+            const s = document.getElementById('status');
+            s.textContent = msg; s.className = 'status ' + (ok ? 'success' : 'error');
+            setTimeout(() => s.style.display = 'none', 3000);
+        }
+
+        fetch('/api/graphics').then(r => r.json()).then(j => {
+            custom = j.graphics || {};
+            refreshLabels();
+            loadBlock();
+        });
+    </script>
+</body>
+</html>
+)rawliteral";
+        request->send(200, "text/html", html); });
+
     server.on("/settings", HTTP_GET, [](AsyncWebServerRequest *request)
               {
         String html = R"rawliteral(
@@ -1593,6 +1844,7 @@ void setupWebServer()
         </div>
 
         <div class="back-link">
+            <a href="/graphics">Graphics</a> |
             <a href="/">← Back to Main</a>
         </div>
     </div>
@@ -1861,6 +2113,66 @@ void setupWebServer()
 
             request->send(200, "application/json", "{\"status\":\"success\"}"); });
 
+    // API endpoint for user graphics
+    server.on("/api/graphics", HTTP_GET, [](AsyncWebServerRequest *request)
+              {
+        StaticJsonDocument<8192> doc;
+        JsonObject g = doc.createNestedObject("graphics");
+        for (int i = 0; i < 26; i++)
+            if (userGraphics[i].length() > 0)
+                g[String((char)('A' + i))] = userGraphics[i];
+        String response;
+        serializeJson(doc, response);
+        request->send(200, "application/json", response); });
+
+    server.on("/api/graphics", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+              {
+            String *body;
+            if (index == 0) {
+                request->_tempObject = new String();
+                ((String *)request->_tempObject)->reserve(total);
+            }
+            body = (String *)request->_tempObject;
+            body->concat((const char *)data, len);
+            if (index + len < total)
+                return;
+
+            StaticJsonDocument<512> doc;
+            DeserializationError error = deserializeJson(doc, *body);
+            delete body;
+            request->_tempObject = NULL;
+            if (error) {
+                request->send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
+                return;
+            }
+
+            String blockStr = doc["block"].as<String>();
+            String gdata = doc["data"].as<String>();
+            if (blockStr.length() != 1 || toupper(blockStr[0]) < 'A' || toupper(blockStr[0]) > 'Z') {
+                request->send(400, "application/json", "{\"error\":\"block must be A-Z\"}");
+                return;
+            }
+            char block = toupper(blockStr[0]);
+            int idx = block - 'A';
+
+            preferences.begin("faux-lite", false);
+            String key = "gfx" + String(block);
+            if (gdata.isEmpty()) {
+                // Clear -> drop custom def and delete the block on the sign
+                // (<DGx> restores the built-in default graphic)
+                preferences.remove(key.c_str());
+                userGraphics[idx] = "";
+                sendToProlite("<DG" + String(block) + ">");
+            } else {
+                String clean = sanitizeGraphicData(gdata);
+                preferences.putString(key.c_str(), clean);
+                userGraphics[idx] = clean;
+                sendToProlite("<G" + String(block) + ">" + clean);
+            }
+            preferences.end();
+
+            request->send(200, "application/json", "{\"status\":\"success\"}"); });
+
     // API endpoint to start a queue (?queue=N, default 0)
     server.on("/api/loop/start", HTTP_POST, [](AsyncWebServerRequest *request)
               {
@@ -1879,6 +2191,13 @@ void setupWebServer()
     server.on("/api/loop/stop", HTTP_POST, [](AsyncWebServerRequest *request)
               {
         stopQueue();
+        request->send(200, "application/json", "{\"status\":\"success\"}"); });
+
+    // API endpoint to fully wipe the sign (pages + graphics). Shows the
+    // sign's built-in HELLO briefly - emergency reset only.
+    server.on("/api/wipe-sign", HTTP_POST, [](AsyncWebServerRequest *request)
+              {
+        wipeSign();
         request->send(200, "application/json", "{\"status\":\"success\"}"); });
 
     // API endpoint for WiFi reset
@@ -1936,32 +2255,125 @@ void displayMessage(String text, String color, String function)
     sendToProlite(command);
 }
 
-void displayBootMessage(String text, String color, String function, int times)
+void displayBootMessage(String text, String color, bool wifiIcon)
 {
-    // Write boot message to Page Z (temporary page)
-    // Always use <FQ> (APPEAR) animation for system messages
-    String command = "<PZ><C" + color + "><F" + function + ">" + text + " ";
+    // Write system message to Page Z (temporary page) with small 4x7 font
+    // and static Appear for a clean look. wifiIcon prepends graphic block W.
+    // <SJ> goes right before the text - a <BW> graphic insert resets font state.
+    String command = "<PZ><FQ><C" + color + ">";
+    if (wifiIcon)
+        command += "<BW>";
+    command += "<SJ>" + text;
     sendToProlite(command);
     delay(100);
 
-    // Run Page Z for 'times' iterations, then return to Page A
-    // Format: <RPZ><nn><RPA> where nn is 01-99
-    String timesStr = String(times);
-    if (times < 10)
-        timesStr = "0" + timesStr;
-    String runCommand = "<RPZ><" + timesStr + "><RPA>";
-    sendToProlite(runCommand);
+    // Run Page Z until the next step replaces it
+    sendToProlite("<RPZ>");
+}
+
+void displayBootMessageRaw(String body)
+{
+    // Write a raw page body to Page Z and run it until replaced
+    sendToProlite("<PZ>" + body);
+    delay(100);
+    sendToProlite("<RPZ>");
 }
 
 void blankDisplay()
 {
-    // Delete all pages and graphics
-    sendToProlite("<D*>");
-    delay(500);
-    // Create blank page with single space to properly blank the display
-    sendToProlite("<PA> ");
-    delay(500);
+    // Quick blank: page A = all-black graphic -> truly blank. An empty page
+    // falls back to the sign's built-in "HELLO" demo, and <D*> briefly shows
+    // HELLO during the wipe - so we don't wipe here, just overwrite page A.
+    sendToProlite("<PA><FQ><BB>");
+    delay(200);
     sendToProlite("<RPA>");
+}
+
+void sendSignGraphics()
+{
+    // Upload our custom graphic blocks - the sign persists them, so they only
+    // need re-sending after a <D*> wipe, but it's cheap insurance each boot.
+    sendWifiGraphic();
+    delay(100);
+    sendBlankGraphic();
+    delay(100);
+    // User graphics go last so they can override the built-ins if desired
+    sendUserGraphics();
+    delay(100);
+}
+
+void wipeSign()
+{
+    // Full wipe: deletes ALL pages and restores default graphic blocks.
+    // The sign shows its built-in "HELLO" while it has no valid page - this
+    // is only for manual/emergency resets, not normal operation.
+    sendToProlite("<D*>");
+    delay(1000); // give the sign time to finish the wipe
+    sendSignGraphics();
+    blankDisplay();
+}
+
+void sendWifiGraphic()
+{
+    // Define graphic block W as a WiFi icon (18 dots x 7 rows; R/G/Y/B per dot,
+    // anything else is black). Insert it into text with <BW>.
+    // The payload must be exactly 126 bytes - pad/trim to be safe.
+    String g = "<GW>"
+               "BBBBBGGGGGGGGBBBBBBBBGGBBBBBBBBGGBBBBBGGBBBGGGGBBBGGBBBBGGBBGGBBGGBBGGBBBBBBBBGBBBBGBBBBBBBBBBBBBBGGBBBBBBBBBBBBBBBBGGBBBBBBBB";
+    g = g.substring(0, 130);
+    while (g.length() < 130)
+        g += 'B';
+    sendToProlite(g);
+}
+
+void sendBlankGraphic()
+{
+    // Graphic block B = fully black 18x7. Used to make a truly blank page -
+    // a page with no visible content falls back to the sign's built-in HELLO.
+    String g = "<GB>";
+    for (int i = 0; i < 126; i++)
+        g += 'B';
+    sendToProlite(g);
+}
+
+String sanitizeGraphicData(String data)
+{
+    // Only R/G/Y/B are valid dots; anything else becomes black. Pad/trim to
+    // the fixed 126-byte (18x7) graphic payload.
+    data.toUpperCase();
+    String out;
+    out.reserve(126);
+    for (size_t i = 0; i < data.length() && out.length() < 126; i++)
+    {
+        char c = data[i];
+        out += (c == 'R' || c == 'G' || c == 'Y' || c == 'B') ? c : 'B';
+    }
+    while (out.length() < 126)
+        out += 'B';
+    return out;
+}
+
+void loadUserGraphics()
+{
+    preferences.begin("faux-lite", true);
+    for (int i = 0; i < 26; i++)
+    {
+        String key = "gfx" + String((char)('A' + i));
+        userGraphics[i] = preferences.getString(key.c_str(), "");
+    }
+    preferences.end();
+}
+
+void sendUserGraphics()
+{
+    for (int i = 0; i < 26; i++)
+    {
+        if (userGraphics[i].length() == 126)
+        {
+            sendToProlite("<G" + String((char)('A' + i)) + ">" + userGraphics[i]);
+            delay(100);
+        }
+    }
 }
 
 void restoreLastDisplay()
