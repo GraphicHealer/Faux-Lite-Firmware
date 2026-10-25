@@ -163,6 +163,13 @@ void setup()
     blankDisplay();
     delay(500);
 
+    // Beep once to signal the sign link is up - <FO> is its own segment, so
+    // run it once via the chain form, then let the branding take over Page Z
+    sendToProlite("<PZ><FO> ");
+    delay(100);
+    sendToProlite("<RPZ><01><RPA>");
+    delay(1000);
+
     // Show boot branding on Page Z: "Faux" italic + "-Lite" bold, small, bright red
     displayBootMessageRaw("<CC><FQ><SC><SJ>Faux<SB><SJ>-Lite");
     delay(3000); // Wait 3 seconds for message to display
